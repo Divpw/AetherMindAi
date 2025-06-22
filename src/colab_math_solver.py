@@ -1,26 +1,31 @@
 import re
-import numpy as np # Though direct use might be minimal, good for context
 from sympy import (
-    sympify, diff, integrate, solve, limit,
+    sympify, diff, integrate, solve, limit, series,
     sin, cos, tan, asin, acos, atan,
-    pi, exp, log, sqrt, Abs, I, oo, zoo,
+    pi, exp, log, sqrt, Abs, I, oo, zoo, S,
     symbols, Symbol, Function, Eq, Rational, Float, Integer,
-    Derivative, Integral, Limit as SympyLimit, # SympyLimit to avoid conflict with built-in limit
+    Derivative, Integral, Limit as SympyLimit,
     Matrix, det,
     latex, pretty,
     factorial, expand, factor, simplify,
-    series,
-    dsolve, Symbol as SympySymbol # dsolve for differential equations
+    dsolve
 )
-from sympy.parsing.sympy_parser import parse_expr, standard_transformations, implicit_multiplication_application
+from sympy.parsing.sympy_parser import (
+    parse_expr,
+    standard_transformations,
+    implicit_multiplication_application,
+    function_exponentiation
+)
+from sympy.core.sympify import SympifyError
 
 # Define common symbols that users might use without explicitly defining them.
+# Using S.Infinity for oo, S.ComplexInfinity for zoo, S.ImaginaryUnit for I
 x, y, z, t = symbols('x y z t')
-a, b, c, d = symbols('a b c d') # More generic symbols
-theta, phi = symbols('theta phi') # Common Greek letters for angles
+a, b, c, d = symbols('a b c d')
+theta, phi = symbols('theta phi')
+f, g, h = symbols('f g h', cls=Function) # Pre-define f, g, h as functions
 
-# Global context for sympify, making common SymPy functions and constants available.
-# This allows strings like "sin(x) + pi" to be parsed correctly.
+# Global context for parse_expr, making common SymPy functions and constants available.
 SYMPY_GLOBALS = {
     # Symbols
     'x': x, 'y': y, 'z': z, 't': t,
@@ -29,465 +34,406 @@ SYMPY_GLOBALS = {
     # Functions - Mathematical
     'sin': sin, 'cos': cos, 'tan': tan,
     'asin': asin, 'acos': acos, 'atan': atan,
-    'exp': exp, 'log': log, 'sqrt': sqrt,
-    'Abs': Abs, 'factorial': factorial,
-    # Functions - SymPy specific operations that might be in a query string
-    'integrate': integrate,
-    'diff': diff,
-    'solve': solve, # Note: solve is tricky with sympify if equations are not Eq()
-    'limit': limit,
+    'exp': exp, 'ln': log, 'log': log, 'sqrt': sqrt, # Added ln as alias for log
+    'abs': Abs, 'Abs': Abs, 'factorial': factorial, # Added abs as alias for Abs
+    # Functions - SymPy specific operations
+    'integrate': integrate, 'Integral': Integral,
+    'diff': diff, 'Derivative': Derivative,
+    'solve': solve, 'Eq': Eq,
+    'limit': limit, 'Limit': SympyLimit,
     'series': series,
     'expand': expand, 'factor': factor, 'simplify': simplify,
-    'Derivative': Derivative, 'Integral': Integral, 'Limit': SympyLimit, 'Eq': Eq,
     'Matrix': Matrix, 'det': det,
     'dsolve': dsolve,
     # Constants
-    'pi': pi, 'E': exp(1), 'I': I, # E for Euler's number, I for imaginary unit
-    'oo': oo, 'zoo': zoo, # Infinity and complex infinity
-    # Classes/Types (less likely to be typed directly in basic queries but good for completeness)
-    'Symbol': SympySymbol, 'Function': Function,
+    'pi': pi, 'E': exp(1), 'I': S.ImaginaryUnit,
+    'oo': S.Infinity, 'zoo': S.ComplexInfinity,
+    # Classes/Types (less likely to be typed directly but good for completeness)
+    'Symbol': Symbol, 'Function': Function,
     'Rational': Rational, 'Float': Float, 'Integer': Integer,
-    # Common functions that might be used as unapplied functions
-    'f': Function('f'), 'g': Function('g'), 'h': Function('h'),
+    # Pre-defined functions
+    'f': f, 'g': g, 'h': h,
 }
 
-# Transformations for parse_expr, allowing things like "2x" to be "2*x"
-# and "sin x" to be "sin(x)"
-PARSE_TRANSFORMATIONS = standard_transformations + (implicit_multiplication_application,)
+# Transformations for parse_expr
+PARSE_TRANSFORMATIONS = standard_transformations + (implicit_multiplication_application, function_exponentiation)
 
+print("colab_math_solver.py initialized with enhanced SymPy context.")
 
-# To be populated further
-print("colab_math_solver.py initialized with imports and SymPy context.")
+def _parse_arguments_str(args_str: str) -> list:
+    """
+    Parses a comma-separated string of arguments, respecting parentheses and tuples.
+    Example: "x, (y, 0, 1), z" -> ["x", "(y, 0, 1)", "z"]
+    """
+    args = []
+    current_arg = ""
+    paren_level = 0
+    for char in args_str:
+        if char == ',' and paren_level == 0:
+            args.append(current_arg.strip())
+            current_arg = ""
+        else:
+            current_arg += char
+            if char == '(':
+                paren_level += 1
+            elif char == ')':
+                paren_level -= 1
+    args.append(current_arg.strip())
+    return [arg for arg in args if arg] # Filter out empty strings
+
+def _handle_empty_arg(arg_str: str, arg_name: str, command: str):
+    if not arg_str:
+        raise ValueError(f"{arg_name} for {command} cannot be empty.")
+    return arg_str
+
+def _parse_expr_wrapper(expr_str: str, context_msg: str = "") -> any:
+    """Wrapper for parse_expr to provide better error messages."""
+    try:
+        if not expr_str:
+            raise ValueError(f"Expression string is empty {context_msg}.")
+        return parse_expr(expr_str, local_dict=SYMPY_GLOBALS, transformations=PARSE_TRANSFORMATIONS)
+    except SympifyError as e:
+        raise SympifyError(f"Failed to parse expression '{expr_str}' {context_msg}. Details: {e}", e)
+    except Exception as e: # Catch other potential errors during parsing
+        raise ValueError(f"Unexpected error parsing expression '{expr_str}' {context_msg}. Details: {type(e).__name__}({e})")
+
 
 def solve_math_query(query: str) -> str:
     """
     Parses and evaluates a mathematical query string using SymPy.
 
-    Handles:
-    - Basic arithmetic and direct SymPy expressions.
-    - Calculus: diff, integrate, limit, series.
-    - Algebra: solve, expand, factor, simplify.
-    - Matrix operations: det.
-    - Differential equations: dsolve.
-    - Output formatting: latex, pretty.
-    - Numerical evaluation: .evalf().
-
-    Args:
-        query (str): The mathematical query string.
-
-    Returns:
-        str: The result of the evaluation or an error message.
+    Handles various commands like diff, integrate, solve, limit, series, etc.,
+    with improved argument parsing and error handling.
+    Uses pretty() for output where possible.
     """
     query = query.strip()
-    original_query = query # For error messages or context
+    original_query = query
 
     try:
-        # Phase 1: Direct evaluation for simple expressions or if query is a SymPy object method
-        # e.g., "pi.evalf(10)", "sin(x)**2 + cos(x)**2", "simplify(sin(x)**2 + cos(x)**2)"
-        # Using parse_expr for more robust parsing than sympify alone for initial string.
-        # It handles transformations like "2x" to "2*x".
+        # Regex for commands: command_name whitespace? ( actual_args )
+        # We capture command_name and actual_args.
+        # actual_args will be further processed by _parse_arguments_str
+        command_match = re.match(r"^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.*)\)\s*$", query, re.IGNORECASE)
 
-        # Check for specific commands first using regex to guide parsing
-        # This allows for more structured argument handling for complex functions.
+        if command_match:
+            command = command_match.group(1).lower()
+            args_str = command_match.group(2).strip()
 
-        # Command: diff(expression, var1, order1, var2, order2, ...)
-        # Corrected regex: First arg is non-comma, rest is everything else for further parsing
-        match = re.match(r"diff\s*\(([^,]+)\s*,(.+)\)", query, re.IGNORECASE)
-        if match:
-            expr_str = match.group(1).strip()
-            if not expr_str: raise ValueError("Expression for diff cannot be empty.")
-            args_str = match.group(2).strip()
+            # Split arguments string by top-level commas
+            raw_args = _parse_arguments_str(args_str)
 
-            # DEBUG for Q22
-            # if "f(x,y)" in expr_str and "x, y" in args_str :
-            #     print(f"[DEBUG-DIFF] expr_str: '{expr_str}', args_str: '{args_str}'")
+            if command == "diff":
+                if len(raw_args) < 2: raise ValueError("diff requires at least 2 arguments: expression and variable(s).")
+                expr_str = _handle_empty_arg(raw_args[0], "Expression", "diff")
+                expr = _parse_expr_wrapper(expr_str, "for diff expression")
 
-            expr = parse_expr(expr_str, local_dict=SYMPY_GLOBALS, transformations=PARSE_TRANSFORMATIONS)
+                diff_vars_orders = []
+                for i in range(1, len(raw_args)):
+                    arg_component = raw_args[i]
+                    # Check if it's a symbol followed by an optional integer order
+                    parts = [p.strip() for p in arg_component.split(',')] # e.g. "x,2" or just "x"
+                    var_sym_str = _handle_empty_arg(parts[0], "Variable", "diff")
+                    var_sym = _parse_expr_wrapper(var_sym_str, f"for diff variable '{var_sym_str}'")
+                    if not isinstance(var_sym, Symbol):
+                        raise ValueError(f"Expected a symbol for differentiation, got '{var_sym_str}'.")
+                    diff_vars_orders.append(var_sym)
+                    if len(parts) > 1:
+                        order_str = _handle_empty_arg(parts[1], "Order", "diff")
+                        try:
+                            order = int(order_str)
+                            if order < 0: raise ValueError("Order for diff must be non-negative.")
+                            diff_vars_orders.append(order)
+                        except ValueError:
+                            raise ValueError(f"Invalid order '{order_str}' for diff, must be an integer.")
+                result = diff(expr, *diff_vars_orders)
+                return pretty(result)
 
-            # Parse differentiation variables and orders
-            # Example: "x" or "x, 2" or "x, y, 2" (for mixed partials)
-            # SymPy's diff expects arguments like: diff(expr, symbol1, order1, symbol2, order2, ...)
-            parsed_diff_args = []
-            raw_diff_args = [s.strip() for s in args_str.split(',')]
-            current_arg_idx = 0
-            while current_arg_idx < len(raw_diff_args):
-                var_name = raw_diff_args[current_arg_idx]
-                # Ensure var_name is not empty, could happen with trailing commas
-                if not var_name:
-                    current_arg_idx +=1
-                    continue
-                var_sym = SYMPY_GLOBALS.get(var_name, symbols(var_name))
-                parsed_diff_args.append(var_sym)
-                current_arg_idx += 1
-                # Check if next arg is an order for the current var
-                if current_arg_idx < len(raw_diff_args) and raw_diff_args[current_arg_idx].isdigit():
-                    parsed_diff_args.append(int(raw_diff_args[current_arg_idx]))
-                    current_arg_idx += 1
-                # else, it's a variable with an implicit order of 1, which is fine for sympy.diff
+            elif command == "integrate":
+                if len(raw_args) < 2: raise ValueError("integrate requires at least 2 arguments: expression and variable/tuple.")
+                expr_str = _handle_empty_arg(raw_args[0], "Expression", "integrate")
+                expr = _parse_expr_wrapper(expr_str, "for integrate expression")
 
-            result = diff(expr, *parsed_diff_args)
-            return pretty(result)
+                integration_var_specs = []
+                for i in range(1, len(raw_args)):
+                    var_spec_str = _handle_empty_arg(raw_args[i], "Variable/Tuple", "integrate")
+                    var_spec_parsed = _parse_expr_wrapper(var_spec_str, f"for integrate variable/bounds '{var_spec_str}'")
 
-        # Command: integrate(expression, var_or_tuple) or integrate(expression, (var, low, high))
-        match = re.match(r"integrate\s*\((.+)\s*,\s*(.+)\)", query, re.IGNORECASE)
-        if match:
-            expr_str = match.group(1).strip()
-            if not expr_str: raise ValueError("Expression for integrate cannot be empty.")
-            var_spec_str = match.group(2).strip()
-            if not var_spec_str: raise ValueError("Variable specification for integrate cannot be empty.")
-
-            expr = parse_expr(expr_str, local_dict=SYMPY_GLOBALS, transformations=PARSE_TRANSFORMATIONS)
-
-            # Parse the variable specification string (e.g., "x" or "(x,0,1)" or "(x,0,oo)")
-            try:
-                # Let parse_expr handle the structure, including tuples.
-                var_spec_parsed = parse_expr(var_spec_str, local_dict=SYMPY_GLOBALS, transformations=PARSE_TRANSFORMATIONS)
-            except Exception as e_parse_var:
-                raise ValueError(f"Could not parse integration variable/bounds: '{var_spec_str}'. Error: {e_parse_var}")
-
-            if isinstance(var_spec_parsed, SympySymbol):
-                # Indefinite integral: var_spec_parsed is the symbol
-                result = integrate(expr, var_spec_parsed)
-            elif isinstance(var_spec_parsed, tuple) and len(var_spec_parsed) == 3:
-                # Definite integral: var_spec_parsed is (symbol, low_bound, high_bound)
-                # Ensure the first element of the tuple is a symbol
-                if not isinstance(var_spec_parsed[0], SympySymbol):
-                    raise ValueError(f"First element in integration tuple must be a symbol, got {type(var_spec_parsed[0])} for '{var_spec_str}'")
-                # Ensure bounds are valid expressions (already handled by parse_expr for var_spec_parsed)
-                result = integrate(expr, var_spec_parsed)
-            else:
-                # Not a symbol and not a 3-tuple, unsupported format for integration variable/bounds
-                raise ValueError(f"Invalid format for integration variable/bounds: '{var_spec_str}'. Expected a symbol (e.g., x) or a tuple (e.g., (x, 0, 1)).")
-            return pretty(result)
-
-        # Command: solve(equations, variables)
-        # equations can be "expr" (implies expr=0), "Eq(lhs, rhs)", "[Eq(..), Eq(..)]"
-        # variables can be "x", "[x,y]"
-        match = re.match(r"solve\s*\((.+)\s*,\s*(.+)\)", query, re.IGNORECASE)
-        if match:
-            eqs_str = match.group(1).strip()
-            if not eqs_str: raise ValueError("Equations for solve cannot be empty.")
-            vars_str = match.group(2).strip()
-            if not vars_str: raise ValueError("Variables for solve cannot be empty.")
-
-            # Parse variables first
-            cleaned_vars_str = vars_str.strip()
-            if cleaned_vars_str.startswith('[') and cleaned_vars_str.endswith(']'):
-                vars_list_str = cleaned_vars_str[1:-1].split(',')
-                # Filter out empty strings that might result from "[,]" or trailing commas
-                parsed_vars = [SYMPY_GLOBALS.get(v.strip(), symbols(v.strip())) for v in vars_list_str if v.strip()]
-                if not parsed_vars and vars_list_str: # Original list was not empty but all items were whitespace
-                     raise ValueError("Variables list for solve is empty or contains only whitespace.")
-            else:
-                if not cleaned_vars_str: raise ValueError("Variable for solve cannot be empty.")
-                parsed_vars = [SYMPY_GLOBALS.get(cleaned_vars_str, symbols(cleaned_vars_str))]
-
-            # Parse equations
-            # This is tricky because equations can be expressions (assumed =0) or Eq instances
-            # If it's a list of equations for a system:
-            if eqs_str.startswith('[') and eqs_str.endswith(']'):
-                eq_list_str = eqs_str[1:-1]
-                # Need a robust way to split equations in a list, respecting commas within Eq, etc.
-                # For now, assume simple comma separation of individual Eq strings or expressions
-                # Split by comma only if the comma is not inside parentheses.
-                # Filter out empty strings that might result from splitting if there are trailing commas.
-                individual_eq_strs = [s.strip() for s in re.split(r',(?![^()]*\))', eq_list_str) if s.strip()]
-
-                parsed_eqs = []
-                for eq_s in individual_eq_strs:
-                    # If user types "x**2 = 4", parse it into an Eq object
-                    if '=' in eq_s and not eq_s.lower().startswith("eq("):
-                        parts = eq_s.split('=', 1)
-                        if len(parts) == 2: # Ensure the split is valid
-                            lhs, rhs = parts
-                            lhs_strip = lhs.strip()
-                            rhs_strip = rhs.strip()
-                            if not lhs_strip: raise ValueError("LHS of equation cannot be empty.")
-                            if not rhs_strip: raise ValueError("RHS of equation cannot be empty.")
-                            lhs_expr = parse_expr(lhs_strip, local_dict=SYMPY_GLOBALS, transformations=PARSE_TRANSFORMATIONS)
-                            rhs_expr = parse_expr(rhs_strip, local_dict=SYMPY_GLOBALS, transformations=PARSE_TRANSFORMATIONS)
-                            parsed_eqs.append(Eq(lhs_expr, rhs_expr))
-                        else: # Malformed equation string with '='
-                            raise ValueError(f"Malformed equation string with '=': {eq_s}")
-                    else: # Assumed to be an expression (e.g., x**2-4 for x**2-4=0) or an explicit Eq(..)
-                        eq_s_strip = eq_s.strip()
-                        if not eq_s_strip: raise ValueError("Equation string/expression in list cannot be empty.")
-                        parsed_eqs.append(parse_expr(eq_s_strip, local_dict=SYMPY_GLOBALS, transformations=PARSE_TRANSFORMATIONS))
-            else: # Single equation string
-                eqs_str_strip = eqs_str.strip() # Use the already stripped and checked eqs_str
-                if not eqs_str_strip: raise ValueError("Equation for solve cannot be empty.") # Should be caught by initial check on eqs_str
-                if '=' in eqs_str_strip and not eqs_str_strip.lower().startswith("eq("):
-                    parts = eqs_str_strip.split('=', 1)
-                    if len(parts) == 2:
-                        lhs, rhs = parts
-                        lhs_strip = lhs.strip()
-                        rhs_strip = rhs.strip()
-                        if not lhs_strip: raise ValueError("LHS of equation cannot be empty.")
-                        if not rhs_strip: raise ValueError("RHS of equation cannot be empty.")
-                        lhs_expr = parse_expr(lhs_strip, local_dict=SYMPY_GLOBALS, transformations=PARSE_TRANSFORMATIONS)
-                        rhs_expr = parse_expr(rhs_strip, local_dict=SYMPY_GLOBALS, transformations=PARSE_TRANSFORMATIONS)
-                        parsed_eqs = Eq(lhs_expr, rhs_expr)
+                    if isinstance(var_spec_parsed, Symbol): # Indefinite integral: integrate(expr, x)
+                        integration_var_specs.append(var_spec_parsed)
+                    elif isinstance(var_spec_parsed, tuple) and len(var_spec_parsed) == 3: # Definite: (x, low, high)
+                        if not isinstance(var_spec_parsed[0], Symbol):
+                            raise ValueError(f"First element in integration tuple must be a symbol, got {type(var_spec_parsed[0])} in '{var_spec_str}'.")
+                        integration_var_specs.append(var_spec_parsed)
+                    elif isinstance(var_spec_parsed, tuple) and len(var_spec_parsed) == 1 and isinstance(var_spec_parsed[0], Symbol): # integrate(expr, (x))
+                         integration_var_specs.append(var_spec_parsed[0])
                     else:
-                        raise ValueError(f"Malformed equation string with '=': {eqs_str_strip}")
+                        raise ValueError(f"Invalid format for integration variable/bounds: '{var_spec_str}'. Expected symbol or (symbol, low, high) or (symbol).")
+
+                result = integrate(expr, *integration_var_specs)
+                return pretty(result)
+
+            elif command == "solve":
+                if len(raw_args) < 1: raise ValueError("solve requires at least 1 argument: equation(s) [and optionally variables].")
+                eqs_str_arg = _handle_empty_arg(raw_args[0], "Equation(s)", "solve")
+
+                # Determine if it's a list of equations or a single one
+                parsed_eqs_arg = _parse_expr_wrapper(eqs_str_arg, "for solve equations")
+
+                equations_to_solve = []
+                if isinstance(parsed_eqs_arg, list) or isinstance(parsed_eqs_arg, tuple):
+                    for item in parsed_eqs_arg:
+                        if isinstance(item, Eq): equations_to_solve.append(item)
+                        elif hasattr(item, 'is_Equality') and item.is_Equality: equations_to_solve.append(item) # For Eq objects parsed as such
+                        else: equations_to_solve.append(Eq(item, 0)) # Assume expr = 0
+                elif isinstance(parsed_eqs_arg, Eq) or (hasattr(parsed_eqs_arg, 'is_Equality') and parsed_eqs_arg.is_Equality):
+                    equations_to_solve.append(parsed_eqs_arg)
+                else: # Single expression, assumed to be expr = 0
+                    equations_to_solve.append(Eq(parsed_eqs_arg, 0))
+
+                vars_to_solve_for = []
+                if len(raw_args) > 1:
+                    vars_str_arg = _handle_empty_arg(raw_args[1], "Variables", "solve")
+                    parsed_vars_arg = _parse_expr_wrapper(vars_str_arg, "for solve variables")
+                    if isinstance(parsed_vars_arg, list) or isinstance(parsed_vars_arg, tuple):
+                        for v in parsed_vars_arg:
+                            if not isinstance(v, Symbol): raise ValueError(f"Expected symbol in variable list for solve, got {type(v)}: '{v}'.")
+                            vars_to_solve_for.append(v)
+                    elif isinstance(parsed_vars_arg, Symbol):
+                        vars_to_solve_for.append(parsed_vars_arg)
+                    else:
+                        raise ValueError(f"Variables for solve must be a symbol or a list/tuple of symbols. Got: '{vars_str_arg}'")
+
+                result = solve(equations_to_solve, *vars_to_solve_for)
+                return pretty(result)
+
+            elif command == "limit":
+                if len(raw_args) < 3: raise ValueError("limit requires 3 arguments: expression, variable, point [and optionally direction].")
+                expr_str = _handle_empty_arg(raw_args[0], "Expression", "limit")
+                expr = _parse_expr_wrapper(expr_str, "for limit expression")
+
+                var_str = _handle_empty_arg(raw_args[1], "Variable", "limit")
+                var_sym = _parse_expr_wrapper(var_str, f"for limit variable '{var_str}'")
+                if not isinstance(var_sym, Symbol): raise ValueError(f"Limit variable must be a symbol, got '{var_str}'.")
+
+                point_str = _handle_empty_arg(raw_args[2], "Point", "limit")
+                point = _parse_expr_wrapper(point_str, f"for limit point '{point_str}'")
+
+                direction = '+' # Default direction
+                if len(raw_args) > 3:
+                    dir_str_raw = raw_args[3].strip()
+                    # Remove quotes if present, e.g. "'+'" or "'-'"
+                    dir_str = dir_str_raw.replace("'", "").replace('"', '')
+                    if dir_str not in ['+', '-']: raise ValueError(f"Limit direction must be '+' or '-', got '{dir_str_raw}'.")
+                    direction = dir_str
+
+                result = limit(expr, var_sym, point, dir=direction)
+                return pretty(result)
+
+            elif command == "series":
+                if len(raw_args) < 1: raise ValueError("series requires at least an expression argument.")
+                expr_str = _handle_empty_arg(raw_args[0], "Expression", "series")
+                expr = _parse_expr_wrapper(expr_str, "for series expression")
+
+                series_args = [expr]
+                # Optional args: x, x0, n
+                if len(raw_args) > 1: # variable x
+                    var_str = _handle_empty_arg(raw_args[1], "Variable", "series")
+                    var_sym = _parse_expr_wrapper(var_str, f"for series variable '{var_str}'")
+                    if not isinstance(var_sym, Symbol): raise ValueError(f"Series variable must be a symbol, got '{var_str}'.")
+                    series_args.append(var_sym)
+                if len(raw_args) > 2: # point x0
+                    point_str = _handle_empty_arg(raw_args[2], "Point (x0)", "series")
+                    series_args.append(_parse_expr_wrapper(point_str, f"for series point x0 '{point_str}'"))
+                if len(raw_args) > 3: # number of terms n
+                    n_str = _handle_empty_arg(raw_args[3], "Number of terms (n)", "series")
+                    try:
+                        n_val = int(n_str)
+                        series_args.append(n_val)
+                    except ValueError:
+                        raise ValueError(f"Number of terms (n) for series must be an integer, got '{n_str}'.")
+
+                result = series(*series_args)
+                return pretty(result)
+
+            elif command in ["latex", "pretty"]:
+                if len(raw_args) != 1: raise ValueError(f"{command} requires 1 argument: expression.")
+                expr_str = _handle_empty_arg(raw_args[0], "Expression", command)
+                expr = _parse_expr_wrapper(expr_str, f"for {command} expression")
+                if hasattr(expr, 'doit') and isinstance(expr, (Integral, Derivative, SympyLimit)):
+                    expr = expr.doit()
+                return latex(expr) if command == "latex" else pretty(expr)
+
+            elif command == "det":
+                if len(raw_args) != 1: raise ValueError("det requires 1 argument: matrix.")
+                matrix_str = _handle_empty_arg(raw_args[0], "Matrix", "det")
+                matrix_expr = _parse_expr_wrapper(matrix_str, "for det matrix")
+                if not isinstance(matrix_expr, Matrix):
+                    raise ValueError("Argument for 'det' must be a Matrix object (e.g., Matrix([[1,2],[3,4]])).")
+                result = det(matrix_expr)
+                return pretty(result)
+
+            elif command == "dsolve":
+                if len(raw_args) < 2: raise ValueError("dsolve requires at least 2 arguments: equation and function.")
+                eq_str = _handle_empty_arg(raw_args[0], "Equation", "dsolve")
+                # Equation can be an expression (assumed == 0) or an Eq object
+                eq_parsed = _parse_expr_wrapper(eq_str, "for dsolve equation")
+                if not isinstance(eq_parsed, Eq) and not (hasattr(eq_parsed, 'is_Equality') and eq_parsed.is_Equality) :
+                    # if not an Eq object, assume it's an expression that should be equal to 0
+                     eq_to_solve = Eq(eq_parsed, 0)
                 else:
-                     parsed_eqs = parse_expr(eqs_str_strip, local_dict=SYMPY_GLOBALS, transformations=PARSE_TRANSFORMATIONS)
+                     eq_to_solve = eq_parsed
 
-            result = solve(parsed_eqs, *parsed_vars)
-            return pretty(result)
+                func_str = _handle_empty_arg(raw_args[1], "Function", "dsolve")
+                func_to_solve = _parse_expr_wrapper(func_str, f"for dsolve function '{func_str}'")
+                # Optional hint argument
+                # hint_str = raw_args[2] if len(raw_args) > 2 else ""
+                # result = dsolve(eq_to_solve, func_to_solve, hint=hint_str if hint_str else 'default')
+                result = dsolve(eq_to_solve, func_to_solve)
+                return pretty(result)
 
-        # Command: limit(expression, var, point, dir) (dir is optional: "+", "-")
-        # Corrected regex for point to be less greedy and correctly capture direction
-        match = re.match(r"limit\s*\((.+)\s*,\s*(\w+)\s*,\s*([^,]+)(?:\s*,\s*['\"]([+\-])['\"])?\s*\)", query, re.IGNORECASE)
-        if match:
-            expr_str, var_str, point_str, dir_str = match.groups()
-            expr_arg_str = expr_str.strip()
-            if not expr_arg_str: raise ValueError("Expression for limit cannot be empty.")
-            expr = parse_expr(expr_arg_str, local_dict=SYMPY_GLOBALS, transformations=PARSE_TRANSFORMATIONS)
+            # Simple commands that take one expression argument and call a SymPy function
+            elif command in ["expand", "factor", "simplify"]:
+                if len(raw_args) != 1: raise ValueError(f"{command} requires 1 argument: expression.")
+                expr_str = _handle_empty_arg(raw_args[0], "Expression", command)
+                expr = _parse_expr_wrapper(expr_str, f"for {command} expression")
+                if command == "expand": result = expand(expr)
+                elif command == "factor": result = factor(expr)
+                elif command == "simplify": result = simplify(expr)
+                return pretty(result)
 
-            var_arg_str = var_str.strip() # \w+ ensures var_str is not empty if matched
-            var_sym = SYMPY_GLOBALS.get(var_arg_str, symbols(var_arg_str))
-
-            point_expr_str = point_str.strip() # [^,]+ ensures point_str is not empty if matched
-            if not point_expr_str: raise ValueError("Limit point cannot be empty.") # Redundant due to [^,]+ but good practice
-            point = parse_expr(point_expr_str, local_dict=SYMPY_GLOBALS, transformations=PARSE_TRANSFORMATIONS)
-
-            if dir_str: # dir_str will be '+' or '-'
-                result = limit(expr, var_sym, point, dir=str(dir_str)) # Explicitly cast to string
-            else:
-                result = limit(expr, var_sym, point) # Do not pass dir if None
-            return pretty(result)
-
-        # Command: series(expression, var, point, n) (point, n optional)
-        match = re.match(r"series\s*\((.+?)(?:\s*,\s*(\w+))?(?:\s*,\s*([^,]+))?(?:\s*,\s*(\d+))?\s*\)", query, re.IGNORECASE)
-        if match:
-            expr_str, var_str, point_str, n_str = match.groups()
-
-            expr_arg_str = expr_str.strip()
-            if not expr_arg_str: raise ValueError("Expression for series cannot be empty.")
-            expr = parse_expr(expr_arg_str, local_dict=SYMPY_GLOBALS, transformations=PARSE_TRANSFORMATIONS)
-
-            args = [expr]
-            if var_str:
-                var_arg_str = var_str.strip()
-                if not var_arg_str: raise ValueError("Variable for series cannot be empty if specified.")
-                args.append(SYMPY_GLOBALS.get(var_arg_str, symbols(var_arg_str)))
-
-            if point_str: # point_str could be None if var_str is also None
-                point_arg_str = point_str.strip()
-                if not point_arg_str: raise ValueError("Point for series cannot be empty if specified.")
-                args.append(parse_expr(point_arg_str, local_dict=SYMPY_GLOBALS, transformations=PARSE_TRANSFORMATIONS))
-
-            if n_str: # n_str is from \d+, so it's digits or None
-                args.append(int(n_str.strip())) # .strip() is good practice though \d+ shouldn't have spaces
-            result = series(*args)
-            return pretty(result)
-
-        # Command: latex(expression)
-        match = re.match(r"latex\s*\((.+)\)", query, re.IGNORECASE)
-        if match:
-            expr_str = match.group(1).strip()
-            if not expr_str: raise ValueError("Expression for latex cannot be empty.")
-            expr = parse_expr(expr_str, local_dict=SYMPY_GLOBALS, transformations=PARSE_TRANSFORMATIONS)
-            # For integrals, derivatives etc., apply doit() before latex for evaluated form
-            if hasattr(expr, 'doit') and isinstance(expr, (Integral, Derivative, SympyLimit)):
-                expr = expr.doit()
-            return latex(expr)
-
-        # Command: pretty(expression)
-        match = re.match(r"pretty\s*\((.+)\)", query, re.IGNORECASE)
-        if match:
-            expr_str = match.group(1).strip()
-            if not expr_str: raise ValueError("Expression for pretty cannot be empty.")
-            expr = parse_expr(expr_str, local_dict=SYMPY_GLOBALS, transformations=PARSE_TRANSFORMATIONS)
-            if hasattr(expr, 'doit') and isinstance(expr, (Integral, Derivative, SympyLimit)):
-                expr = expr.doit()
-            return pretty(expr)
-
-        # Command: det(Matrix([...])) or det(matrix_var)
-        match = re.match(r"det\s*\((.+)\)", query, re.IGNORECASE)
-        if match:
-            matrix_str = match.group(1).strip()
-            if not matrix_str: raise ValueError("Argument for det cannot be empty.")
-            # This assumes matrix_str is directly parsable by parse_expr into a Matrix object
-            # e.g., "Matrix([[1,2],[3,4]])"
-            matrix_expr = parse_expr(matrix_str, local_dict=SYMPY_GLOBALS, transformations=PARSE_TRANSFORMATIONS)
-            if not isinstance(matrix_expr, Matrix):
-                return "Error: Argument for 'det' must be a Matrix object (e.g., Matrix([[1,2],[3,4]]))."
-            result = det(matrix_expr)
-            return pretty(result)
-
-        # Command: dsolve(equation, function)
-        match = re.match(r"dsolve\s*\((.+)\s*,\s*(.+)\)", query, re.IGNORECASE)
-        if match:
-            eq_str = match.group(1).strip()
-            if not eq_str: raise ValueError("Equation for dsolve cannot be empty.")
-            func_str = match.group(2).strip()
-            if not func_str: raise ValueError("Function for dsolve cannot be empty.")
-
-            func_to_solve = parse_expr(func_str, local_dict=SYMPY_GLOBALS, transformations=PARSE_TRANSFORMATIONS)
-
-            eq_strip = eq_str.strip() # Use the stripped version
-            if not eq_strip: raise ValueError("Equation for dsolve (after strip) cannot be empty.") # Should be caught by initial check
-            if '=' in eq_strip and not eq_strip.lower().startswith("eq("):
-                parts = eq_strip.split('=', 1)
-                if len(parts) == 2:
-                    lhs, rhs = parts
-                    lhs_s, rhs_s = lhs.strip(), rhs.strip()
-                    if not lhs_s or not rhs_s: raise ValueError("LHS or RHS of dsolve equation is empty.")
-                    lhs_expr = parse_expr(lhs_s, local_dict=SYMPY_GLOBALS, transformations=PARSE_TRANSFORMATIONS)
-                    rhs_expr = parse_expr(rhs_s, local_dict=SYMPY_GLOBALS, transformations=PARSE_TRANSFORMATIONS)
-                    eq = Eq(lhs_expr, rhs_expr)
-                else:
-                    raise ValueError(f"Malformed equation string with '=' for dsolve: {eq_strip}")
-            else:
-                eq = parse_expr(eq_strip, local_dict=SYMPY_GLOBALS, transformations=PARSE_TRANSFORMATIONS)
-
-            result = dsolve(eq, func_to_solve)
-            return pretty(result)
+            else: # Unrecognized command but matched command_match regex
+                raise ValueError(f"Unrecognized math command: '{command}'. Supported commands include diff, integrate, solve, limit, series, expand, factor, simplify, det, dsolve, latex, pretty.")
 
 
         # Phase 2: General expression evaluation or specific method calls like .evalf()
         # This handles queries like "sin(pi/4)", "x*y + 2*x", or "my_expr.evalf(10)"
-        # If it's a specific method call like .evalf()
-        evalf_match = re.match(r"(.+)\s*\.\s*evalf\s*(?:\(\s*(\d*)\s*\))?$", query, re.IGNORECASE)
+        evalf_match = re.match(r"(.+?)\s*\.\s*evalf\s*(?:\(\s*(\d*)\s*\))?$", query, re.IGNORECASE)
         if evalf_match:
-            expr_str = evalf_match.group(1).strip()
-            if not expr_str: raise ValueError("Expression for .evalf() cannot be empty.")
-            precision_str = evalf_match.group(2) # precision_str can be None or empty if no precision given
+            expr_str = _handle_empty_arg(evalf_match.group(1).strip(), "Expression", ".evalf()")
+            precision_str = evalf_match.group(2)
 
-            expr = parse_expr(expr_str, local_dict=SYMPY_GLOBALS, transformations=PARSE_TRANSFORMATIONS)
-            if hasattr(expr, 'doit'): # Evaluate things like Integral() or Derivative() before evalf
+            expr = _parse_expr_wrapper(expr_str, "for .evalf() expression")
+            if hasattr(expr, 'doit'):
                 expr = expr.doit()
 
             if precision_str and precision_str.strip():
                 result = expr.evalf(int(precision_str))
             else:
                 result = expr.evalf()
-            return str(result) # evalf returns a SymPy Float, convert to string
+            return str(result)
 
-        # Default: try to parse and evaluate the expression directly
-        # This covers arithmetic, function calls like sin(pi/2), variable expressions like x+y
-        # Query was already stripped at the beginning. If it's empty now, it means it was only whitespace.
+        # Default: try to parse and evaluate the expression directly if no command structure found
         if not query: raise ValueError("Query cannot be empty or just whitespace.")
-        expr = parse_expr(query, local_dict=SYMPY_GLOBALS, transformations=PARSE_TRANSFORMATIONS)
+        expr = _parse_expr_wrapper(query, "for general expression")
 
-        # If the expression is a type that should be "done" (like Derivative, Integral objects)
-        # before potentially being returned or further processed.
         if hasattr(expr, 'doit') and isinstance(expr, (Integral, Derivative, SympyLimit)):
             evaluated_expr = expr.doit()
             return pretty(evaluated_expr)
 
-        # Handle matrices specifically before number checks
-        if isinstance(expr, Matrix):
-            return pretty(expr)
+        if isinstance(expr, Matrix): return pretty(expr)
+        if expr.is_Float: return str(expr)
+        if expr.is_Integer or expr.is_Rational: return pretty(expr)
+        if expr.is_number: return str(expr.evalf()) # Default to evalf for other numeric types
 
-        # Numeric results formatting
-        if expr.is_Float: # Already a float, possibly from an evalf() call earlier
-            return str(expr)
-        if expr.is_Integer or expr.is_Rational: # Keep exact form for these
-            return pretty(expr) # Or str(expr) if pretty is too verbose for simple numbers
-        if expr.is_number: # For other types of numbers (e.g. ComplexFloat)
-            return str(expr.evalf()) # Default to evalf for other numeric types
+        return pretty(expr) # Fallback for other symbolic expressions
 
-        # Fallback for other symbolic expressions
-        return pretty(expr)
-
-    except (SyntaxError, TypeError, AttributeError, ValueError, NotImplementedError, Exception) as e:
+    except (SyntaxError, TypeError, AttributeError, ValueError, NotImplementedError, SympifyError) as e:
         error_name = type(e).__name__
         error_msg = str(e)
-        # Provide more specific feedback for common parsing issues
-        if isinstance(e, SyntaxError) and "invalid syntax" in error_msg.lower() and ("<string>" in error_msg or "EOL" in error_msg):
-             return f"Error: Invalid syntax in query '{original_query}'. Please check your expression."
-        if isinstance(e, (TypeError, ValueError)) and "sympy.parsing.sympy_parser" in str(e.__traceback__):
-             return f"Error: Could not parse parts of the mathematical expression '{original_query}'. Details: {error_name}({error_msg})"
-        if isinstance(e, NameError):
+        # Specific feedback for common parsing issues
+        if isinstance(e, SympifyError) or ("parse_expr" in error_msg.lower() or "invalid syntax" in error_msg.lower()):
+             return f"Error: Could not parse mathematical expression '{original_query}'. Please check syntax. Details: {error_name}({error_msg})"
+        if isinstance(e, NameError): # Should be caught by parse_expr if symbol not in SYMPY_GLOBALS
             return f"Error: Undefined symbol or function in query '{original_query}'. Details: {error_msg}"
+        if isinstance(e, ValueError) and "cannot be empty" in error_msg: # Custom empty arg errors
+            return f"Error: {error_msg} in query '{original_query}'."
+        # General error message
         return f"Error processing query '{original_query}': {error_name}({error_msg})"
+    except Exception as e: # Catch any other unexpected errors
+        return f"An unexpected error occurred while processing '{original_query}': {type(e).__name__}({str(e)})"
+
 
 if __name__ == "__main__":
-    print("--- SymPy Math Solver Test ---")
+    print("--- SymPy Math Solver Test (Enhanced) ---")
 
     test_queries = [
-        # Basic arithmetic & direct evaluation
-        "2 + 2",
-        "pi",
-        "pi.evalf()",
-        "pi.evalf(50)",
-        "(1+sqrt(5))/2",
-        "(1+sqrt(5))/2 .evalf()", # Note the space before .evalf() is handled by strip
-        "sin(pi/4)",
-        "sin(pi/4).evalf(20)",
-        "exp(1)",
-        "log(E)", # E is exp(1) in SYMPY_GLOBALS
-        "log(10)",
-        "sqrt(x**2)", # Should give Abs(x)
-        "Abs(x).subs(x, -5)",
-        "Rational(1,3) + Rational(1,6)",
-        "x + y + z", # Simple symbolic
-        "expand((x+y)**3)",
-        "factor(x**3 - y**3)",
-        "simplify((sin(x)**2 + cos(x)**2))",
-
-        # Calculus - Differentiation
-        "diff(x**3 + 2*x, x)",
-        "diff(sin(x)*exp(x), x)",
-        "diff(x**3 * sin(y), x, 2, y, 1)", # diff(expr, x, 2, y, 1) -> d^3f / (dx^2 dy)
-        "diff(f(x,y), x, y)", # Using predefined Function f
-
-        # Calculus - Integration
-        "integrate(sin(x)*cos(x), x)",
-        "integrate(1/x, x)",
-        "integrate(exp(-x), (x, 0, oo))", # Definite integral with SymPy's oo
-        "integrate(x**2, (x, 0, 1))",
-        "integrate(sin(x**2), x)", # Non-elementary integral
-
-        # Calculus - Limits
-        "limit(sin(x)/x, x, 0)",
-        "limit((1+1/x)**x, x, oo)",
-        "limit(1/x, x, 0, '+')", # One-sided limit
-        "limit(1/x, x, 0, '-')",
-
-        # Calculus - Series Expansion
-        "series(cos(x), x, 0, 5)", # Series of cos(x) around x=0 up to O(x^5)
-        "series(exp(x), x, 1, 3)",
-
-        # Algebra - Solving Equations
-        "solve(x**2 - 9, x)",
-        "solve(Eq(x**2, 16), x)", # Using Eq explicitly
-        "solve(x**2 = 25, x)",   # Using '=' directly in solve
-        "solve(a*x**2 + b*x + c, x)", # Symbolic solve
-        "solve([x + y - 5, x - y - 1], [x, y])", # System of linear equations using implicit Eq
-        "solve([Eq(x + y, 5), Eq(x - y, 1)], [x, y])", # System using explicit Eq
-        "solve(x**3 - 6*x**2 + 11*x - 6, x)", # Cubic equation
-
-        # Differential Equations
-        "dsolve(f(x).diff(x) - 2*f(x), f(x))",
-        "dsolve(Eq(f(x).diff(x,x) + f(x), 0), f(x))", # y'' + y = 0
-
-        # Matrix Operations
-        "Matrix([[1,2],[3,4]])", # Direct matrix creation
-        "det(Matrix([[1,2],[3,4]]))",
-        "det(Matrix([[a,b],[c,d]]))",
-
+        # Basic & Direct Eval
+        "2 + 2*x", "pi.evalf(10)", "sin(pi/4)", "sqrt(x**2)", "Abs(x).subs(x, -5)",
+        "expand((x+y)**2)", "factor(x**2 - y**2)", "simplify(sin(x)**2 + cos(x)**2)",
+        # Diff
+        "diff(x**3 + 2*x, x)", "diff(sin(x)*exp(x), x, x)", "diff(x**2*y**3, x, 2, y, 1)", "diff(f(x,y), x, y)",
+        "diff(cos(x), (x))", # Test with tuple for var
+        # Integrate
+        "integrate(sin(x)*cos(x), x)", "integrate(1/x, (x, 1, exp(1)))", "integrate(exp(-x**2), (x, -oo, oo))",
+        "integrate(x*y, x, y)", # Multiple indefinite integrals
+        "integrate(x**2, (x, 0, 1), (y, 0, 2))", # Error: integrate with multiple tuples (SymPy needs one var or one tuple)
+                                                  # Corrected: SymPy integrate handles one var or one (var, low, high) tuple at a time for its direct args.
+                                                  # For multiple integration, it's nested: integrate(integrate(expr, var1_spec), var2_spec)
+                                                  # This test will show current limitation if user tries this flat structure.
+                                                  # A more robust parser might interpret this as nested. For now, it will likely error on second tuple.
+        "integrate(x*y, (x,0,1))", # Indefinite on y, definite on x
+        "integrate(1/(x**2+1), x)",
+        "integrate(log(x), x)",
+        "integrate(exp(-x), (x, 0, oo))",
+        # Solve
+        "solve(x**2 - 9, x)", "solve(Eq(x**2, 16), x)", "solve(x**2 = 4, x)", # Test implicit Eq
+        "solve([x + y - 5, x - y - 1], [x, y])", "solve((x**2-1, x-1), x)",
+        "solve(x**3 - 6*x**2 + 11*x - 6 = 0, x)",
+        "solve(Eq(f(x), x**2), f(x))", # Solving for a function (general solution)
+        # Limit
+        "limit(sin(x)/x, x, 0)", "limit((1+1/x)**x, x, oo)", "limit(1/x, x, 0, '+')", "limit(1/x, x, 0, '-')",
+        "limit( (x**2-1)/(x-1), x, 1)",
+        # Series
+        "series(cos(x), x, 0, 5)", "series(exp(x), x, 1, 3)", "series(log(1+x), x, 0, 4)",
+        "series(1/(1-x))", # Default around x=0, default terms
+        # Dsolve
+        "dsolve(f(x).diff(x) - 2*f(x), f(x))", "dsolve(Eq(f(x).diff(x,x) + f(x), 0), f(x))",
+        "dsolve(y*f(x).diff(x) + x*f(x) - x, f(x))", # More complex ODE
+        # Matrix
+        "Matrix([[1,2],[3,4]])", "det(Matrix([[1,x],[y,2]]))",
         # Output Formatting
-        "latex(integrate(1/x, x))",
-        "pretty(integrate(1/x, x))",
-        "latex(Matrix([[1,x],[y,2]]))",
-
-        # Error Handling Test Cases
-        "integrate(sin(x) بدون معنى, x)", # Invalid syntax within sympy parse
-        "solve(x+*y=5,x)", # Syntax error before specific command parsing
-        "diff(x, y, z)", # Mismatched args for diff if z is not int
-        "unknown_function(x)",
-        "1/0", # Should be caught by SymPy as zoo or error
-        "limit(1/x, x, non_symbol)", # Error in point for limit
-        "solve(x=5, non_existent_var)",
-        "det(x+y)", # det on non-matrix
-        "evalf(sin(x))" # evalf as a command (current regex expects .evalf())
+        "latex(integrate(1/x,x))", "pretty(series(sin(x),x,0,4))",
+        # Nested / Complex Tuple Inputs
+        "integrate(x*sin(y), (x,0,1), (y,0,pi))", # This should be parsed as integrate(expr, (x,0,1), (y,0,pi))
+                                                   # and then SymPy's integrate will take expr, then (x,0,1), then (y,0,pi)
+                                                   # This is how SymPy's own integrate takes multiple limit tuples.
+        "integrate(x*y*z, (x,0,1), (y,0,1), (z,0,1))",
+        # Error Handling Cases
+        "diff(x**2, x, y, 2, z)", # Valid if x,y,z are symbols
+        "integrate(nonexistent_func(x), x)", # NameError
+        "solve(x+*y=5,x)", # SyntaxError in expression
+        "limit(1/x, x, non_symbol)", # SympifyError for point
+        "series(sin(x), x, 0, non_integer_n)", # ValueError for n
+        "det(x+y)", # Error: det on non-matrix
+        "unsupported_command(x)", # ValueError for command
+        "solve(x=2, )", # Error: empty variable for solve
+        "integrate(x, )", # Error: empty integration var
+        "diff( , x)", # Error: empty expression for diff
+        "limit(sin(x)/x, x, 0, 'both')", # Error: invalid direction for limit
+        "integrate(x, (x, 0))", # Error: incomplete tuple for integration
+        "integrate(x, (x, 0, 1, 2))", # Error: tuple too long for integration
+        "solve([x+y=5, x-y=1], x, y)" # Variables should be a list/tuple [x,y] or single var
     ]
 
-    for i, query in enumerate(test_queries):
-        print(f"Query {i+1}: \"{query}\"")
-        result = solve_math_query(query)
-        print(f"Result:\n{result}")
+    for i, t_query in enumerate(test_queries):
+        print(f"\nQuery {i+1}: \"{t_query}\"")
+        result = solve_math_query(t_query)
+        # For latex, print raw string to see it better
+        if t_query.startswith("latex("):
+            print(f"Raw LaTeX Result: {result}")
+        else:
+            print(f"Result:\n{result}")
         print("-" * 40)
+
+    print("\n--- Specific Error Case Example ---")
+    err_query = "solve(x**2 = 4, [x, nonexistent_var])"
+    print(f"Query: \"{err_query}\"")
+    result = solve_math_query(err_query)
+    print(f"Result:\n{result}")
+    print("-" * 40)
+
+    err_query_2 = "integrate(1/x, (x, 0, oo, oo))" # Tuple too long
+    print(f"Query: \"{err_query_2}\"")
+    result = solve_math_query(err_query_2)
+    print(f"Result:\n{result}")
+    print("-" * 40)
