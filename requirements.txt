@@ -1,0 +1,18 @@
+# AetherMindAI Project Requirements
+
+# Core LLM/Transformer Libraries
+transformers>=4.30.0
+torch>=2.0.0
+accelerate>=0.20.0
+bitsandbytes>=0.40.0 # Required for 4-bit/8-bit quantization if used with models like Phi-2
+
+# Mathematical and Data Handling Libraries
+sympy>=1.12
+numpy>=1.23.0
+pandas>=1.5.0
+
+# Machine Learning Libraries
+scikit-learn>=1.2.0
+
+# Plotting Libraries
+matplotlib>=3.6.0
